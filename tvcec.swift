@@ -5,6 +5,11 @@
 // undocumented IODPDevice* functions in IOKit, resolved at runtime as MacTV does
 // (github.com/pengchujin/MacTV, MIT). Writes are limited to the CEC block, so
 // display timing, resolution and rotation (Crisp's job) are never touched.
+//
+// On Macs that macOS does not enable CEC for (tested on MacBookPro18,3), the
+// converter's transmitter is cut off the bus until SMC GPIO gP12, named
+// function-hdmi_cec_en in the device tree, is driven high. That write is
+// undocumented and needs root, so the pin is high only while a command runs.
 
 import Darwin
 import Foundation
@@ -283,9 +288,51 @@ final class CECSession {
 
 enum Power: String { case on, off }
 
-/// Opens the port, runs one power command and always restores the tunnel state.
+/// Drives the CEC enable pin for the lifetime of a command. Only this key is ever written.
+final class CECEnablePin {
+    private var connection: io_connect_t = 0
+
+    init() throws {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        guard service != 0 else { throw CECFailure("AppleSMC not found") }
+        defer { IOObjectRelease(service) }
+        guard IOServiceOpen(service, mach_task_self_, 0, &connection) == KERN_SUCCESS else {
+            throw CECFailure("cannot open AppleSMC")
+        }
+        try write(0x0100_0001) // CMD_OUTPUT | high, see Linux gpio-macsmc.c
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    func close() {
+        try? write(0x0100_0000)
+        IOServiceClose(connection)
+    }
+
+    private func write(_ value: UInt32) throws {
+        // SMCParamStruct: key@0, keyInfo.dataSize@28, data8@42, bytes@48.
+        var input = [UInt8](repeating: 0, count: 80)
+        var output = [UInt8](repeating: 0, count: 80)
+        input.withUnsafeMutableBytes {
+            $0.storeBytes(of: UInt32(0x6750_3132), toByteOffset: 0, as: UInt32.self) // 'gP12'
+            $0.storeBytes(of: UInt32(4), toByteOffset: 28, as: UInt32.self)
+            $0.storeBytes(of: value, toByteOffset: 48, as: UInt32.self)
+        }
+        input[42] = 6 // SMC write
+        var size = 80
+        let result = IOConnectCallStructMethod(connection, 2, &input, 80, &output, &size)
+        guard result == KERN_SUCCESS, output[40] == 0 else {
+            throw CECFailure(String(format: "gP12 write failed: 0x%08x/0x%02x (run as root)", result, output[40]))
+        }
+    }
+}
+
+/// Opens the port, runs one power command and always restores the pin and tunnel state.
 func deliver(_ power: Power) throws -> Bool {
+    let lock = try PortLock()
+    defer { lock.release() }
     let port = try HardwarePort()
+    let pin = try CECEnablePin()
+    defer { pin.close() }
     let session = try CECSession(io: port)
     defer { session.close() }
     switch power {
@@ -304,11 +351,37 @@ func deliver(_ power: Power) throws -> Bool {
     }
 }
 
+/// Serializes the daemon and manual commands; the CEC registers are a single shared mailbox.
+final class PortLock {
+    private let descriptor: Int32
+
+    init() throws {
+        let path = "/var/run/tvcec.lock"
+        descriptor = open(path, O_CREAT | O_RDWR, 0o600)
+        guard descriptor >= 0 else { throw CECFailure("cannot open \(path)") }
+        for _ in 0..<30 {
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        close(descriptor)
+        throw CECFailure("another tvcec command is using the port")
+    }
+
+    func release() {
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+}
+
 // MARK: - Commands
 
 func runStatus() -> Int32 {
     do {
+        let lock = try PortLock()
+        defer { lock.release() }
         let port = try HardwarePort()
+        let pin = try CECEnablePin()
+        defer { pin.close() }
         let capability = try port.read(DPCD.capability, count: 1)[0]
         let control = try port.read(DPCD.control, count: 1)[0]
         let mask = try port.read(DPCD.addressMask, count: 2)
