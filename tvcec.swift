@@ -373,6 +373,85 @@ final class PortLock {
     }
 }
 
+// MARK: - Power state machine
+
+/// Sends each transition once. `delivered` becomes nil after a failure, so the
+/// next event or HDMI reconnect retries instead of being deduplicated away.
+final class PowerController {
+    private let queue = DispatchQueue(label: "tvcec.power")
+    private let wakeDelays: [TimeInterval]
+    private let send: (Power) throws -> Bool
+    private var desired = Power.on
+    private var delivered: Power?
+    private var generation = 0
+
+    init(wakeDelays: [TimeInterval] = [1.5, 3, 5, 10], send: @escaping (Power) throws -> Bool) {
+        self.wakeDelays = wakeDelays
+        self.send = send
+    }
+
+    func systemWillSleep(completion: @escaping () -> Void) {
+        queue.async { [self] in
+            generation += 1
+            desired = .off
+            if delivered == .off {
+                Log.write("sleep: standby already delivered, skipping")
+            } else {
+                _ = attempt(.off)
+            }
+            completion()
+        }
+    }
+
+    func systemDidWake(reason: String) {
+        queue.async { [self] in
+            Log.write("event: \(reason)")
+            desired = .on
+            guard delivered != .on else { return }
+            generation += 1
+            scheduleWake(attempt: 0, token: generation)
+        }
+    }
+
+    func displayReconnected() {
+        queue.async { [self] in
+            Log.write("event: display added")
+            guard desired == .on, delivered != .on else { return }
+            generation += 1
+            scheduleWake(attempt: 0, token: generation)
+        }
+    }
+
+    /// For tests: blocks until queued work has run.
+    func drain() { queue.sync {} }
+
+    private func scheduleWake(attempt index: Int, token: Int) {
+        guard index < wakeDelays.count else {
+            Log.write("wake: giving up after \(wakeDelays.count) attempts; will retry on the next display event")
+            return
+        }
+        queue.asyncAfter(deadline: .now() + wakeDelays[index]) { [self] in
+            guard token == generation, desired == .on, delivered != .on else { return }
+            if !attempt(.on) { scheduleWake(attempt: index + 1, token: token) }
+        }
+    }
+
+    private func attempt(_ power: Power) -> Bool {
+        do {
+            if try send(power) {
+                delivered = power
+                Log.write("power \(power.rawValue): delivered")
+                return true
+            }
+            Log.write("power \(power.rawValue): TV did not acknowledge")
+        } catch {
+            Log.write("power \(power.rawValue): \(error)")
+        }
+        delivered = nil
+        return false
+    }
+}
+
 // MARK: - Commands
 
 func runStatus() -> Int32 {
@@ -523,6 +602,31 @@ func runSelfTest() -> Int32 {
     edid.replaceSubrange(132..<138, with: [0x65, 0x03, 0x0c, 0x00, 0x10, 0x00])
     check("reads 1.0.0.0 from EDID", parsePhysicalAddress(fromEDID: edid) == 0x1000)
 
+    var log: [Power] = []
+    var succeed = true
+    let controller = PowerController(wakeDelays: [0, 0, 0]) { log.append($0); return succeed }
+    func settle() { for _ in 0..<3 { controller.drain(); usleep(30000) } }
+    func sleep() {
+        let done = DispatchSemaphore(value: 0)
+        controller.systemWillSleep { done.signal() }
+        done.wait()
+    }
+    sleep(); sleep()
+    check("repeated sleep sends standby once", log == [.off])
+    controller.systemDidWake(reason: "test"); settle()
+    controller.systemDidWake(reason: "test"); settle()
+    check("repeated wake sends wake once", log == [.off, .on])
+    log = []; succeed = false
+    controller.displayReconnected(); settle()
+    check("reconnect while on sends nothing", log.isEmpty)
+    sleep()
+    check("sleep with absent TV does not block", log == [.off])
+    log = []
+    controller.systemDidWake(reason: "test"); settle()
+    check("failed wake retries, then stops", log == [.on, .on, .on])
+    log = []; succeed = true
+    controller.displayReconnected(); settle()
+    check("reconnect retries undelivered wake", log == [.on])
     return failures == 0 ? 0 : 1
 }
 
