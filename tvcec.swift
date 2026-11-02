@@ -9,11 +9,14 @@
 // On Macs that macOS does not enable CEC for (tested on MacBookPro18,3), the
 // converter's transmitter is cut off the bus until SMC GPIO gP12, named
 // function-hdmi_cec_en in the device tree, is driven high. That write is
-// undocumented and needs root, so the pin is high only while a command runs.
+// undocumented and needs root, so wake/standby run as root via a sudoers rule
+// and the pin is high only while a command runs.
 
+import AppKit
 import Darwin
 import Foundation
 import IOKit
+import IOKit.pwr_mgt
 
 // MARK: - Logging
 
@@ -34,6 +37,8 @@ enum Log {
         defer { lock.unlock() }
         let line = "\(formatter.string(from: Date())) \(message)\n"
         fputs(line, stderr)
+        // A root child reports through stderr; the agent owns the log file.
+        guard geteuid() != 0 else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
         if let size = attributes?[.size] as? Int, size > maxBytes {
@@ -452,6 +457,80 @@ final class PowerController {
     }
 }
 
+// MARK: - Daemon
+
+final class SleepWatcher {
+    // iokit_common_msg() macros from IOMessage.h, which Swift cannot import.
+    private static let canSystemSleep: UInt32 = 0xe000_0270
+    private static let systemWillSleep: UInt32 = 0xe000_0280
+
+    private let controller: PowerController
+    private var rootPort: io_connect_t = 0
+    private var notifier: io_object_t = 0
+    private var notificationPort: IONotificationPortRef?
+    private var observers: [NSObjectProtocol] = []
+    private var reconnectPending = false
+
+    /// How long sleep may wait for the CEC command before being allowed regardless.
+    private static let sleepBudget: TimeInterval = 5
+
+    init(controller: PowerController) { self.controller = controller }
+
+    func start() throws {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        rootPort = IORegisterForSystemPower(context, &notificationPort, { context, _, message, argument in
+            Unmanaged<SleepWatcher>.fromOpaque(context!).takeUnretainedValue().handle(message, argument)
+        }, &notifier)
+        guard rootPort != 0, let notificationPort else { throw CECFailure("IORegisterForSystemPower failed") }
+        CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(notificationPort).takeUnretainedValue(), .defaultMode)
+
+        // Unlike kIOMessageSystemHasPoweredOn, these skip Power Nap dark wakes.
+        let center = NSWorkspace.shared.notificationCenter
+        for (name, reason) in [(NSWorkspace.didWakeNotification, "system woke"), (NSWorkspace.screensDidWakeNotification, "screens woke")] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [controller] _ in
+                controller.systemDidWake(reason: reason)
+            })
+        }
+
+        CGDisplayRegisterReconfigurationCallback({ _, flags, context in
+            guard flags.contains(.addFlag), !flags.contains(.beginConfigurationFlag) else { return }
+            Unmanaged<SleepWatcher>.fromOpaque(context!).takeUnretainedValue().displayAdded()
+        }, context)
+    }
+
+    private func handle(_ message: UInt32, _ argument: UnsafeMutableRawPointer?) {
+        let token = Int(bitPattern: argument)
+        switch message {
+        case Self.canSystemSleep:
+            IOAllowPowerChange(rootPort, token) // Never veto idle sleep.
+        case Self.systemWillSleep:
+            Log.write("event: system will sleep")
+            var allowed = false
+            let allow = { [rootPort] in
+                guard !allowed else { return }
+                allowed = true
+                IOAllowPowerChange(rootPort, token)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.sleepBudget) {
+                if !allowed { Log.write("sleep: CEC budget exceeded, allowing sleep") }
+                allow()
+            }
+            controller.systemWillSleep { DispatchQueue.main.async(execute: allow) }
+        default:
+            break
+        }
+    }
+
+    private func displayAdded() {
+        guard !reconnectPending else { return }
+        reconnectPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [self] in
+            reconnectPending = false
+            controller.displayReconnected()
+        }
+    }
+}
+
 // MARK: - Commands
 
 func runStatus() -> Int32 {
@@ -533,6 +612,42 @@ func runPower(_ power: Power) -> Int32 {
         print("error: \(error)")
         return 1
     }
+}
+
+/// Runs a power command as root through the sudoers rule, logging its output.
+func deliverViaSudo(_ power: Power) throws -> Bool {
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+    process.arguments = ["-n", CommandLine.arguments[0], power == .on ? "wake" : "standby"]
+    process.standardOutput = pipe
+    process.standardError = pipe
+    try process.run()
+    let watchdog = DispatchWorkItem { process.terminate() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
+    let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    watchdog.cancel()
+    output.split(separator: "\n").forEach { Log.write("  \($0)") }
+    switch process.terminationStatus {
+    case 0: return true
+    case 2: return false
+    default: throw CECFailure("root helper exited with \(process.terminationStatus)")
+    }
+}
+
+func runDaemon() -> Never {
+    Log.write("daemon started (pid \(getpid()))")
+    let controller = PowerController { try deliverViaSudo($0) }
+    let watcher = SleepWatcher(controller: controller)
+    do {
+        try watcher.start()
+    } catch {
+        Log.write("fatal: \(error)")
+        exit(1)
+    }
+    withExtendedLifetime(watcher) { RunLoop.main.run() }
+    exit(0)
 }
 
 // MARK: - Self test
@@ -641,9 +756,10 @@ enum Main {
         case "standby": exit(runPower(.off))
         case "status": exit(runStatus())
         case "monitor": exit(runMonitor(seconds: arguments.dropFirst().first.flatMap(TimeInterval.init) ?? 30))
+        case "daemon": runDaemon()
         case "selftest": exit(runSelfTest())
         default:
-            print("usage: tvcec wake | standby | status | monitor [seconds] | selftest")
+            print("usage: tvcec wake | standby | status | monitor [seconds] | daemon | selftest")
             exit(64)
         }
     }
