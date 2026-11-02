@@ -1,62 +1,67 @@
 # tvcec
 
-Mac uyurken veya ekranı uyuyunca Samsung TV'yi HDMI-CEC ile standby'a alır, uyanınca açar. MacBookPro18,3 (M1 Pro), macOS 27 ve Samsung LE22D450G1W üzerinde test edildi.
+Turns a TV off and on over HDMI-CEC when a Mac's screens or the Mac itself sleep and wake. It also makes CEC transmit work on the built-in HDMI port of a MacBook Pro where macOS leaves it disabled.
 
-## Yöntem
+**Tested on one setup only:** MacBookPro18,3 (M1 Pro), macOS 27, Samsung LE22D450G1W. Other Macs and TVs are untested. Reports are welcome.
 
-- **CEC:** DPCD CEC tüneli (`0x3000` bloğu), belgelenmemiş `IODPDevice*` fonksiyonlarıyla. MacTV'nin yöntemi budur.
-- **M1 Pro için ek adım:** macOS bu portta CEC'i etkinleştirmez. Komut çalışırken SMC `gP12` pini (device tree: `function-hdmi_cec_en`) yüksek yapılır, bitince düşürülür. Bu olmadan TV ACK vermez.
-- **Olaylar:** Uyku için `IORegisterForSystemPower`, uyanma için `NSWorkspace` (Power Nap uyanışlarını atlar), yeniden bağlanma için `CGDisplay` geri çağrısı.
-- **Ekran uykusu:** Ekranlar uyuyunca TV 30 saniye sonra kapanır; ekran bu sürede uyanırsa komut gönderilmez. Mac'in kendisi uyursa TV hemen kapanır.
-- **Oturum kapatma ve kapanış:** TV standby'a alınır, ajan yeniden başlayınca açılır.
-- **Açılış kontrolü:** `wake` sonrası TV'nin güç durumu sorulur. TV standby demeye devam ederse komut yeniden denenir; yanıt gelmemesi hata sayılmaz.
-- **Yetki:** Pin root ister. Ajan kullanıcı olarak çalışır; sudoers kuralı yalnızca `tvcec wake` ve `tvcec standby` komutlarına izin verir.
+## Risks
 
-**Risk:** `gP12` yazmak belgelenmemiştir ve Apple desteklemez. macOS güncellemesi bunu bozabilir. SIP kapatılmaz, sistem dosyaları değiştirilmez. Crisp'in ayarlarına dokunulmaz; yazmalar yalnızca CEC registerlarına ve `gP12`'ye gider.
+This tool uses undocumented interfaces that Apple does not support, and a macOS update can break it. On the M1 Pro it writes to an SMC GPIO pin (`gP12`) as root. That write is the part to weigh before installing:
 
-## Kurulum
+- `gP12` serves other purposes on other Macs. tvcec writes it only if this Mac's device tree names it `function-hdmi_cec_en`; otherwise it leaves the pin alone.
+- The pin goes high only while a command runs.
+- SIP stays on and no system files are changed. tvcec adds a sudoers rule for `tvcec wake` and `tvcec standby`.
 
-Gerekenler: Xcode Command Line Tools ve TV'de Anynet+ açık.
+Use it at your own risk.
+
+## How it works
+
+- **CEC:** DPCD CEC tunneling registers (`0x3000` block), reached through the undocumented `IODPDevice*` functions, as in [MacTV](https://github.com/pengchujin/MacTV). Writes outside the CEC block are refused, so display settings are not touched.
+- **Enable pin:** macOS does not enable CEC on this port, and the TV does not acknowledge frames until `gP12` is high.
+- **Screen sleep:** the TV goes to standby 30 seconds after the screens sleep, unless they wake first.
+- **System sleep, logout and shutdown:** the TV goes to standby right away.
+- **Wake:** the TV turns on and is asked for its power status. The command is retried if it keeps reporting standby.
+
+## Install
+
+You need Xcode Command Line Tools and CEC enabled on the TV (Samsung calls it Anynet+).
 
 ```sh
-./build.sh          # derleme
-./install.sh        # /usr/local/bin/tvcec, /etc/sudoers.d/tvcec, LaunchAgent
-./uninstall.sh      # kaldırma (--purge-logs günlükleri de siler)
+./build.sh
+build/tvcec selftest
+./install.sh              # /usr/local/bin/tvcec, /etc/sudoers.d/tvcec, LaunchAgent
+./uninstall.sh            # add --purge-logs to delete the logs too
 ```
 
-## Komutlar
+The self test does not touch hardware, and its `info` line shows whether the device tree maps the pin on your Mac.
+
+## Commands
 
 ```sh
-sudo tvcec wake       # TV'yi aç
-sudo tvcec standby    # TV'yi standby'a al
-sudo tvcec status     # port, adres ve TV yanıtı
-tvcec monitor 30      # CEC trafiğini dinle
-tvcec selftest        # donanımsız mantık testleri
+sudo tvcec wake       # turn the TV on
+sudo tvcec standby    # put the TV in standby
+sudo tvcec status     # port, address and TV response
+tvcec monitor 30      # listen to CEC traffic
+tvcec selftest        # logic tests without hardware
 ```
 
 ## Test
 
 ```sh
-launchctl print gui/$UID/com.ahmetaltun.tvcec | grep -E 'state|pid'
 tail -f ~/Library/Logs/tvcec/tvcec.log
+pmset displaysleepnow     # in another window
 ```
 
-Apple menüsü > Uyut ile Mac'i uyutun, sonra uyandırın. Günlükte `power off: delivered` ve `power on: delivered` görünmeli.
+The TV should turn off after about 30 seconds and turn on when you move the mouse.
 
-## Günlükler
+## Troubleshooting
 
-- `~/Library/Logs/tvcec/tvcec.log`: olaylar ve CEC çerçeveleri (1 MB'ı geçince `tvcec.log.1` olur)
-- `~/Library/Logs/tvcec/launchd.log`: launchd çıktısı
-
-## Sorun giderme
-
-| Belirti | Kontrol |
+| Symptom | Check |
 |---|---|
-| Kapak kapanınca TV kapanmıyor | Şarjda ve harici ekran bağlıyken kapak Mac'i uyutmayabilir. Günlükte `system will sleep` veya `screens slept` var mı? |
-| `no ACK` veya `did not acknowledge` | TV'de Anynet+ açık mı? `sudo tvcec status` çalıştırın, kabloyu çıkarıp takın. |
-| `gP12 write failed` | `sudo` ile çalıştırın. Ajanda oluyorsa sudoers dosyasını kontrol edin: `sudo visudo -cf /etc/sudoers.d/tvcec`. |
-| `no CEC-capable port` | HDMI kablosu takılı mı? macOS güncellemesi sonrası `IODPDevice` değişmiş olabilir. |
-| `N CEC-capable ports` | Birden çok uygun port var; `tvcec` tahmin yürütmez. |
-| Uyanışta TV açılmıyor | Günlükteki deneme satırlarına bakın. Ajan 4 kez dener, sonra ekran olayını bekler. |
-| Görüntü kesiliyor | `./uninstall.sh` çalıştırın ve Mac'i yeniden başlatın. |
-| BetterDisplay de TV'yi kontrol ediyor | BetterDisplay'in CEC güç kontrolünü kapatın veya uygulamadan çıkın. |
+| The TV stays on | Look for `system will sleep` or `screens slept` in the log. An app can keep the screen awake. |
+| `did not acknowledge` | Check that CEC is on, run `sudo tvcec status` and replug the cable. |
+| `device tree does not map gP12` | This Mac uses a different design. tvcec sends CEC without the pin, which may not reach the TV. |
+| `gP12 write failed` | Run with `sudo`. For the agent, check `sudo visudo -cf /etc/sudoers.d/tvcec`. |
+| `no CEC-capable port` | Check the HDMI cable. A macOS update may also have changed `IODPDevice`. |
+| Video drops out | Run `./uninstall.sh` and restart the Mac. |
+| Another app also controls the TV | Turn off that app's CEC control. |

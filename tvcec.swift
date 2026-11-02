@@ -308,11 +308,31 @@ final class CECSession {
 
 enum Power: String { case on, off }
 
-/// Drives the CEC enable pin for the lifetime of a command. Only this key is ever written.
+/// True if a device tree function entry (phandle, 'pKW4', key, ...) names 'gP12'.
+func namesCECEnablePin(_ entry: [UInt8]) -> Bool {
+    entry.count >= 12 && Array(entry[8..<12]) == [0x32, 0x31, 0x50, 0x67]
+}
+
+/// gP12 does other things on other Macs, so only trust this Mac's own device tree.
+func deviceTreeMapsCECEnablePin() -> Bool {
+    let node = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceNameMatching("dp2hdmi-gpio"))
+    guard node != 0 else { return false }
+    defer { IOObjectRelease(node) }
+    let value = IORegistryEntryCreateCFProperty(node, "function-hdmi_cec_en" as CFString, kCFAllocatorDefault, 0)
+    guard let data = value?.takeRetainedValue() as? Data else { return false }
+    return namesCECEnablePin(Array(data))
+}
+
+/// Drives the CEC enable pin for the lifetime of a command. Only this key is ever written,
+/// and only where the device tree says it is the CEC enable pin.
 final class CECEnablePin {
     private var connection: io_connect_t = 0
 
     init() throws {
+        guard deviceTreeMapsCECEnablePin() else {
+            Log.write("device tree does not map gP12 to CEC; leaving the pin alone")
+            return
+        }
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
         guard service != 0 else { throw CECFailure("AppleSMC not found") }
         defer { IOObjectRelease(service) }
@@ -324,6 +344,7 @@ final class CECEnablePin {
     }
 
     func close() {
+        guard connection != 0 else { return }
         try? write(0x0100_0000)
         IOServiceClose(connection)
     }
@@ -775,6 +796,9 @@ func runSelfTest() -> Int32 {
     edid[128] = 2; edid[130] = 12
     edid.replaceSubrange(132..<138, with: [0x65, 0x03, 0x0c, 0x00, 0x10, 0x00])
     check("reads 1.0.0.0 from EDID", parsePhysicalAddress(fromEDID: edid) == 0x1000)
+    check("accepts the gP12 device tree entry", namesCECEnablePin([0xb6, 0, 0, 0, 0x34, 0x57, 0x4b, 0x70, 0x32, 0x31, 0x50, 0x67, 0, 0, 0, 0]))
+    check("rejects another pin", !namesCECEnablePin([0xb6, 0, 0, 0, 0x34, 0x57, 0x4b, 0x70, 0x36, 0x30, 0x50, 0x67, 0, 0, 0, 0]))
+    print("info device tree maps gP12 to CEC here: \(deviceTreeMapsCECEnablePin())")
 
     var log: [Power] = []
     var succeed = true

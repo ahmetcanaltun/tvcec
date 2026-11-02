@@ -20,7 +20,7 @@ sudo visudo -cf "$RULE" >/dev/null
 sudo install -o root -g wheel -m 440 "$RULE" "$SUDOERS"
 rm -f "$RULE"
 
-sudo "$BIN" status || { print -u2 "\nThe TV did not acknowledge CEC, so the agent was not started."; exit 2; }
+sudo "$BIN" status || { print -u2 "\ntvcec could not reach the TV over CEC, so the agent was not started. Run ./uninstall.sh to remove it."; exit 2; }
 
 mkdir -p "${PLIST:h}" "$HOME/Library/Logs/tvcec"
 sed "s|__HOME__|$HOME|g" "$LABEL.plist" > "$PLIST"
