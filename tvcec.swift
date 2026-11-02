@@ -26,6 +26,7 @@ enum Log {
     static let file = directory.appendingPathComponent("tvcec.log")
     private static let maxBytes = 1_000_000
     private static let lock = NSLock()
+    static var writesFile = true
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
@@ -38,7 +39,7 @@ enum Log {
         let line = "\(formatter.string(from: Date())) \(message)\n"
         fputs(line, stderr)
         // A root child reports through stderr; the agent owns the log file.
-        guard geteuid() != 0 else { return }
+        guard geteuid() != 0, writesFile else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
         if let size = attributes?[.size] as? Int, size > maxBytes {
@@ -210,6 +211,7 @@ enum SendResult: Equatable {
 
 let tvAddress: UInt8 = 0
 let broadcastAddress: UInt8 = 15
+let powerStatusNames: [UInt8: String] = [0: "on", 1: "standby", 2: "turning on", 3: "turning off"]
 
 final class CECSession {
     private let io: Registers
@@ -289,6 +291,19 @@ final class CECSession {
         }
         return nil
     }
+
+    /// False only if the TV keeps reporting standby. No reply is not a failure:
+    /// a booting TV can stay silent, and macOS can take the receive flag first.
+    func confirmOn(attempts: Int = 3) throws -> Bool {
+        var status: UInt8?
+        for _ in 0..<attempts {
+            pause(1.5)
+            status = try query([0x8f], reply: 0x90).map { $0[2] }
+            if status == 0 || status == 2 { break }
+        }
+        Log.write("tv power status: \(status.flatMap { powerStatusNames[$0] } ?? "no reply")")
+        return status != 1 && status != 3
+    }
 }
 
 enum Power: String { case on, off }
@@ -352,7 +367,7 @@ func deliver(_ power: Power) throws -> Bool {
             // Active Source, so the TV selects this input after turning on.
             _ = try session.send([0x82, UInt8(address >> 8), UInt8(address & 0xff)], to: broadcastAddress)
         }
-        return true
+        return try session.confirmOn()
     }
 }
 
@@ -385,13 +400,15 @@ final class PortLock {
 final class PowerController {
     private let queue = DispatchQueue(label: "tvcec.power")
     private let wakeDelays: [TimeInterval]
+    private let displaySleepDelay: TimeInterval
     private let send: (Power) throws -> Bool
     private var desired = Power.on
     private var delivered: Power?
     private var generation = 0
 
-    init(wakeDelays: [TimeInterval] = [1.5, 3, 5, 10], send: @escaping (Power) throws -> Bool) {
+    init(wakeDelays: [TimeInterval] = [1.5, 3, 5, 10], displaySleepDelay: TimeInterval = 30, send: @escaping (Power) throws -> Bool) {
         self.wakeDelays = wakeDelays
+        self.displaySleepDelay = displaySleepDelay
         self.send = send
     }
 
@@ -408,12 +425,26 @@ final class PowerController {
         }
     }
 
+    /// Delayed, so a screen that wakes again right away does not cycle the TV.
+    func displayDidSleep() {
+        queue.async { [self] in
+            Log.write("event: screens slept")
+            generation += 1
+            desired = .off
+            let token = generation
+            queue.asyncAfter(deadline: .now() + displaySleepDelay) { [self] in
+                guard token == generation, delivered != .off else { return }
+                _ = attempt(.off)
+            }
+        }
+    }
+
     func systemDidWake(reason: String) {
         queue.async { [self] in
             Log.write("event: \(reason)")
+            generation += 1
             desired = .on
             guard delivered != .on else { return }
-            generation += 1
             scheduleWake(attempt: 0, token: generation)
         }
     }
@@ -485,12 +516,22 @@ final class SleepWatcher {
         CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(notificationPort).takeUnretainedValue(), .defaultMode)
 
         // Unlike kIOMessageSystemHasPoweredOn, these skip Power Nap dark wakes.
+        // The screen notifications arrive only in a process with an NSApplication.
         let center = NSWorkspace.shared.notificationCenter
         for (name, reason) in [(NSWorkspace.didWakeNotification, "system woke"), (NSWorkspace.screensDidWakeNotification, "screens woke")] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [controller] _ in
                 controller.systemDidWake(reason: reason)
             })
         }
+        observers.append(center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [controller] _ in
+            controller.displayDidSleep()
+        })
+        observers.append(center.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main) { [controller] _ in
+            Log.write("event: logout or shutdown")
+            let done = DispatchSemaphore(value: 0)
+            controller.systemWillSleep { done.signal() }
+            _ = done.wait(timeout: .now() + Self.sleepBudget)
+        })
 
         CGDisplayRegisterReconfigurationCallback({ _, flags, context in
             guard flags.contains(.addFlag), !flags.contains(.beginConfigurationFlag) else { return }
@@ -559,8 +600,7 @@ func runStatus() -> Int32 {
             return 2
         }
         let reply = try session.query([0x8f], reply: 0x90)
-        let states = [0: "on", 1: "standby", 2: "turning on", 3: "turning off"]
-        print("TV: acknowledged, power \(reply.flatMap { states[Int($0[2])] } ?? "not reported")")
+        print("TV: acknowledged, power \(reply.flatMap { powerStatusNames[$0[2]] } ?? "not reported")")
         return 0
     } catch {
         print("error: \(error)")
@@ -624,7 +664,7 @@ func deliverViaSudo(_ power: Power) throws -> Bool {
     process.standardError = pipe
     try process.run()
     let watchdog = DispatchWorkItem { process.terminate() }
-    DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
+    DispatchQueue.global().asyncAfter(deadline: .now() + 25, execute: watchdog)
     let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
     process.waitUntilExit()
     watchdog.cancel()
@@ -638,6 +678,8 @@ func deliverViaSudo(_ power: Power) throws -> Bool {
 
 func runDaemon() -> Never {
     Log.write("daemon started (pid \(getpid()))")
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
     let controller = PowerController { try deliverViaSudo($0) }
     let watcher = SleepWatcher(controller: controller)
     do {
@@ -646,7 +688,9 @@ func runDaemon() -> Never {
         Log.write("fatal: \(error)")
         exit(1)
     }
-    withExtendedLifetime(watcher) { RunLoop.main.run() }
+    // Logout and shutdown leave the TV in standby, so turn it back on at login.
+    if CGDisplayIsAsleep(CGMainDisplayID()) == 0 { controller.systemDidWake(reason: "daemon started") }
+    withExtendedLifetime(watcher) { app.run() }
     exit(0)
 }
 
@@ -657,6 +701,7 @@ final class FakePort: Registers {
     var sent: [[UInt8]] = []
     var txOutcome: UInt8? = 0x10
     var physicalAddress: UInt16? = 0x1000
+    var powerReply: UInt8?
 
     func read(_ address: UInt32, count: Int) throws -> [UInt8] {
         (0..<count).map { memory[address + UInt32($0), default: 0] }
@@ -672,11 +717,18 @@ final class FakePort: Registers {
             sent.append(try read(DPCD.txBuffer, count: Int(bytes[0] & 0x0f) + 1))
             memory[DPCD.txInfo] = bytes[0] & 0x7f
             if let txOutcome { memory[DPCD.irqFlags, default: 0] |= txOutcome }
+            if let powerReply, sent.last?[1] == 0x8f {
+                memory[DPCD.rxBuffer] = 0x04
+                memory[DPCD.rxBuffer + 1] = 0x90
+                memory[DPCD.rxBuffer + 2] = powerReply
+                memory[DPCD.irqFlags, default: 0] |= 0x01
+            }
         }
     }
 }
 
 func runSelfTest() -> Int32 {
+    Log.writesFile = false
     var failures = 0
     func check(_ name: String, _ condition: Bool) {
         print("\(condition ? "ok  " : "FAIL") \(name)")
@@ -694,6 +746,13 @@ func runSelfTest() -> Int32 {
         check("address NACK is not delivered", try !cec.send([0x36]).delivered)
         port.txOutcome = 0x20
         check("line error is reported", try cec.send([0x36]) == .lineError)
+        port.txOutcome = 0x10
+        check("no power reply still counts as on", try cec.confirmOn(attempts: 1))
+        port.powerReply = 0
+        check("TV reporting on confirms wake", try cec.confirmOn())
+        port.powerReply = 1
+        check("TV staying in standby fails wake", try !cec.confirmOn())
+        port.powerReply = nil
         port.txOutcome = nil
         check("consumed flag is unconfirmed", try cec.send([0x36]) == .unconfirmed)
         cec.close()
@@ -742,6 +801,25 @@ func runSelfTest() -> Int32 {
     log = []; succeed = true
     controller.displayReconnected(); settle()
     check("reconnect retries undelivered wake", log == [.on])
+
+    var idle: [Power] = []
+    let delayed = PowerController(wakeDelays: [0], displaySleepDelay: 0.05) { idle.append($0); return true }
+    func wait() { usleep(120_000); delayed.drain() }
+    delayed.systemDidWake(reason: "test"); wait()
+    idle = []
+    delayed.displayDidSleep()
+    delayed.systemDidWake(reason: "test"); wait()
+    check("screen waking inside the delay cancels standby", idle.isEmpty)
+    delayed.displayDidSleep(); wait()
+    check("screen sleep sends standby after the delay", idle == [.off])
+    delayed.systemDidWake(reason: "test"); wait()
+    check("screen wake turns the TV back on", idle == [.off, .on])
+    idle = []
+    delayed.displayDidSleep()
+    let slept = DispatchSemaphore(value: 0)
+    delayed.systemWillSleep { slept.signal() }
+    slept.wait(); wait()
+    check("system sleep inside the delay sends standby once", idle == [.off])
     return failures == 0 ? 0 : 1
 }
 
